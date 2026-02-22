@@ -19,24 +19,10 @@ class Semantle:
             KeyedVectors, gensim.downloader.load("word2vec-google-news-300")
         )
 
-        self.common_word_list = self.get_common_word_list()
-        self.word_of_the_day = "computer"  # Changed from "bart" to a more common word
+        self.word_of_the_day = "medical"  # Changed from "bart" to a more common word
         self.guesses_dict = {}
         self.guesses_in_order = []
         self.endgame = False
-
-    def get_common_word_list(self) -> list[str]:
-        """
-        Reads in a list of the 5000 most popular words in the English
-        language to select for the word of the day.
-        """
-        path = "semantle/data/popular.txt"  # initially sourced from https://github.com/dolph/dictionary
-        common_word_list = []
-        with open(path, "r") as file:
-            for line in file:
-                line = line.strip()
-                common_word_list.append(line)
-        return common_word_list
 
     def player_guess(self) -> str:
         """

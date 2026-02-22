@@ -51,8 +51,10 @@ class HalfspaceSolver:
             guess = self.vocab[guess_idx]
 
             similarity = self.semantle.check_guess(guess)
+            # Remove the guessed word regardless — re-guessing adds no new constraints
+            # and a duplicate guess creates a zero normal vector that wipes all candidates
+            self.candidates.remove(guess_idx)
             if similarity is None:
-                self.candidates.remove(guess_idx)
                 continue
 
             self.guesses.append((guess, similarity))
