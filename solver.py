@@ -1,5 +1,7 @@
+import re
 import random
 import numpy as np
+import sys
 from semantle.semantle import Semantle
 
 
@@ -81,7 +83,109 @@ class HalfspaceSolver:
         raise ValueError("No candidates remaining — something went wrong")
 
 
+class CrossModelSolver:
+    """
+    Same halfspace idea, but uses a separate sentence-transformer model for the
+    constraint vectors instead of the game's word2vec model. Since the two models
+    disagree on fine-grained ordering, hard filtering would be too aggressive —
+    so instead we score each candidate by how many constraints it satisfies and
+    keep the top scorers each round.
+    """
+
+    _WORD_RE = re.compile(r'^[a-z]+$')
+
+    def __init__(self, semantle: Semantle, score_threshold: float = 0.85):
+        from sentence_transformers import SentenceTransformer
+
+        self.semantle = semantle
+        self.score_threshold = score_threshold  # keep candidates scoring >= this fraction of the max
+
+        # game model — used only to look up guess vectors by name for constraint normals
+        game_model = semantle.model
+        self.game_vocab = game_model.index_to_key
+        self.game_word_to_idx = game_model.key_to_index
+        self.game_vectors = game_model.get_normed_vectors()
+
+        # constraint model — encodes the candidate vocab we'll score against
+        print("Loading sentence-transformer model...")
+        st_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+
+        # Filter to simple single-word entries present in both models
+        self.vocab = [w for w in self.game_vocab if self._WORD_RE.match(w)]
+        print(f"Encoding {len(self.vocab)} words through sentence-transformer...")
+        self.vectors = st_model.encode(
+            self.vocab, batch_size=512, show_progress_bar=True, normalize_embeddings=True
+        )
+        self.word_to_idx = {w: i for i, w in enumerate(self.vocab)}
+        print(f"Done. Candidate vocab: {len(self.vocab)} words\n")
+
+        self.guesses: list[tuple[str, float]] = []
+        self.candidates = list(range(len(self.vocab)))
+
+    def _update_candidates(self):
+        # Ordering comes from game model similarities, but constraint vectors come
+        # from sentence-transformer — so all dot products stay in the same vector space
+        ordered = sorted(self.guesses, key=lambda x: -x[1])
+        word_vecs = np.array([self.vectors[self.word_to_idx[w]] for w, _ in ordered])
+
+        rows, cols = np.triu_indices(len(ordered), k=1)
+        normals = word_vecs[rows] - word_vecs[cols]  # (n_constraints, 384)
+
+        # Score candidates using sentence-transformer vectors — soft scoring because
+        # the two models disagree, so strict filtering would eliminate the true answer
+        candidate_vecs = self.vectors[self.candidates]
+        scores = (normals @ candidate_vecs.T > 0).sum(axis=0)  # count of satisfied constraints
+
+        # Keep candidates within score_threshold of the best score
+        max_score = scores.max()
+        cutoff = int(max_score * self.score_threshold)
+        self.candidates = [idx for idx, s in zip(self.candidates, scores) if s >= cutoff]
+
+    def solve(self):
+        print(f"Target: '{self.semantle.word_of_the_day}'")
+
+        round_num = 0
+
+        while len(self.candidates) > 1:
+            round_num += 1
+            guess_idx = random.choice(self.candidates)
+            guess = self.vocab[guess_idx]
+
+            similarity = self.semantle.check_guess(guess)
+            # Remove the guessed word regardless — re-guessing adds no new constraints
+            self.candidates.remove(guess_idx)
+            if similarity is None:
+                continue
+
+            self.guesses.append((guess, similarity))
+
+            if len(self.guesses) >= 2:
+                before = len(self.candidates)
+                self._update_candidates()
+                after = len(self.candidates)
+                print(f"Round {round_num:3d}: '{guess}' (sim={similarity:.4f})  "
+                      f"{before:>8,} -> {after:>8,} candidates")
+            else:
+                print(f"Round {round_num:3d}: '{guess}' (sim={similarity:.4f})  "
+                      f"(need 2 guesses for constraints)")
+
+            if guess == self.semantle.word_of_the_day:
+                print(f"\nSolved! The word was '{guess}'")
+                return guess
+
+        if len(self.candidates) == 1:
+            answer = self.vocab[self.candidates[0]]
+            correct = self.semantle.check_guess(answer) == 1.0
+            result = "correct!" if correct else f"wrong (target was '{self.semantle.word_of_the_day}')"
+            print(f"\nBest guess: '{answer}' after {round_num} guesses — {result}")
+            return answer
+
+        raise ValueError("No candidates remaining — something went wrong")
+
+
 if __name__ == "__main__":
+    cross = "--cross" in sys.argv
+
     game = Semantle()
-    solver = HalfspaceSolver(game)
+    solver = CrossModelSolver(game) if cross else HalfspaceSolver(game)
     solver.solve()
