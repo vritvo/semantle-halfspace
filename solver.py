@@ -88,24 +88,24 @@ class HalfspaceSolver:
 class CrossModelSolver:
     """
     Same halfspace idea, but uses a separate sentence-transformer model for the
-    constraint vectors instead of the game's word2vec model. Since the two models
-    disagree on fine-grained ordering, hard filtering would be too aggressive —
-    so instead we score each candidate by how many constraints it satisfies and
-    keep the top scorers each round.
+    constraint vectors instead of the game's word2vec model. Instead of hard
+    filtering (which eliminates the target too early when models disagree),
+    uses a probabilistic approach: each constraint contributes a sigmoid
+    probability, and the total score for a candidate is the sum of log-
+    probabilities across all constraints. No word is ever fully eliminated.
     """
 
     _WORD_RE = re.compile(r'^[a-z]+$')
 
-    def __init__(self, semantle: Semantle, score_threshold: float = 0.85):
+    def __init__(self, semantle: Semantle, steepness: float = 5.0):
 
         self.semantle = semantle
-        self.score_threshold = score_threshold  # keep candidates scoring >= this fraction of the max
+        self.steepness = steepness  # sigmoid steepness: higher = more like hard filtering
 
-        # game model — used only to look up guess vectors by name for constraint normals
+        # game model — not used for constraints, just for game interaction
         game_model = semantle.model
         self.game_vocab = game_model.index_to_key
         self.game_word_to_idx = game_model.key_to_index
-        self.game_vectors = game_model.get_normed_vectors()
 
         # constraint model — encodes the candidate vocab we'll score against
         print("Loading sentence-transformer model...")
@@ -121,74 +121,99 @@ class CrossModelSolver:
         print(f"Done. Candidate vocab: {len(self.vocab)} words\n")
 
         self.guesses: list[tuple[str, float]] = []
-        self.candidates = list(range(len(self.vocab)))
+
+        # Log-probability for each word — starts uniform (all zeros = equal probability)
+        self.log_probs = np.zeros(len(self.vocab))
 
         target = semantle.word_of_the_day
-        self.target_idx = self.word_to_idx.get(target)  # None if target not in st vocab
+        self.target_idx = self.word_to_idx.get(target)  # for debug tracking
 
-    def _update_candidates(self):
-        # Ordering comes from game model similarities, but constraint vectors come
-        # from sentence-transformer — so all dot products stay in the same vector space.
-        # Use all pairs, with binary counting of satisfied constraints.
-        ordered = sorted(self.guesses, key=lambda x: -x[1])
-        word_vecs = np.array([self.vectors[self.word_to_idx[w]] for w, _ in ordered])
+    def _log_sigmoid(self, x):
+        # Computes log(sigmoid(x)) using two equivalent formulas — one for x > 0, one for x <= 0.
+        # Both are the same math, rearranged so we always exponentiate a negative number
+        # (which safely underflows to 0) rather than a large positive (which overflows to inf).
+        return np.where(x > 0, -np.log1p(np.exp(-x)), x - np.log1p(np.exp(x)))
 
-        rows, cols = np.triu_indices(len(ordered), k=1)
-        normals = word_vecs[rows] - word_vecs[cols]  # (n_constraints, 384)
+    def _update_log_probs(self, new_guess_word: str, new_guess_sim: float):
+        # Only add constraints between the new guess and all previous guesses,
+        # since previous-vs-previous constraints were already applied.
+        new_vec = self.vectors[self.word_to_idx[new_guess_word]]
 
-        # Score candidates by how many constraints they satisfy
-        candidate_vecs = self.vectors[self.candidates]
-        scores = (normals @ candidate_vecs.T > 0).sum(axis=0)
+        prev_vecs = np.array([self.vectors[self.word_to_idx[w]] for w, _ in self.guesses[:-1]])
+        prev_sims = np.array([s for _, s in self.guesses[:-1]])
 
-        # Keep candidates within score_threshold of the best score
-        max_score = scores.max()
-        if max_score > 0:
-            cutoff = int(max_score * self.score_threshold)
-            self.candidates = [idx for idx, s in zip(self.candidates, scores) if s >= cutoff]
+        # Constraint: the higher-similarity word should be closer to the target.
+        # Normal points from lower-sim toward higher-sim word.
+        normals = np.where(
+            (new_guess_sim > prev_sims)[:, None],
+            new_vec - prev_vecs,
+            prev_vecs - new_vec
+        )  # (n_prev, 384)
 
-    def solve(self):
+        # Grid of dot products: one per (constraint, vocab word) pair — shape (n_prev, n_vocab)
+        dot_products = normals @ self.vectors.T
+        # log-sigmoid values are <= 0, so scores only decrease. Words satisfying constraints
+        # lose little; words violating them lose a lot. Relative ranking is what matters.
+        self.log_probs += self._log_sigmoid(self.steepness * dot_products).sum(axis=0)
+
+    def solve(self, max_rounds: int = 500):
         print(f"Target: '{self.semantle.word_of_the_day}'")
 
         round_num = 0
+        guessed = set()
 
-        while len(self.candidates) > 1:
+        while round_num < max_rounds:
             round_num += 1
-            guess_idx = random.choice(self.candidates)
+
+            # Sample the next guess proportional to posterior probability.
+            # Subtract max for numerical stability before exponentiating.
+            log_p = self.log_probs.copy()
+            # Zero out already-guessed words so we don't repeat
+            for idx in guessed:
+                log_p[idx] = -np.inf
+
+            # Convert log_probs → probabilities for sampling.
+            # Shift by max first: without this, very negative values (e.g. -50000) would
+            # underflow to 0 after exp(), losing all relative differences between words.
+            log_p -= log_p.max()
+            probs = np.exp(log_p)   # undo the log: exp(log(p)) = p
+            probs /= probs.sum()    # normalize to sum to 1
+
+            guess_idx = np.random.choice(len(self.vocab), p=probs)
             guess = self.vocab[guess_idx]
+            guessed.add(guess_idx)
 
             similarity = self.semantle.check_guess(guess)
-            # Remove the guessed word regardless — re-guessing adds no new constraints
-            self.candidates.remove(guess_idx)
             if similarity is None:
                 continue
 
             self.guesses.append((guess, similarity))
 
             if len(self.guesses) >= 2:
-                before = len(self.candidates)
-                target_was_present = self.target_idx in self.candidates
-                self._update_candidates()
-                after = len(self.candidates)
-                target_now_present = self.target_idx in self.candidates
-                eliminated_marker = "  *** target eliminated ***" if target_was_present and not target_now_present else ""
-                print(f"Round {round_num:3d}: '{guess}' (sim={similarity:.4f})  "
-                      f"{before:>8,} -> {after:>8,} candidates{eliminated_marker}")
+                self._update_log_probs(guess, similarity)
+
+                # Report the target's rank in the current posterior
+                target_rank = None
+                if self.target_idx is not None:
+                    target_rank = (self.log_probs > self.log_probs[self.target_idx]).sum() + 1
+
+                rank_info = f"  (target rank: {target_rank})" if target_rank is not None else ""
+                print(f"Round {round_num:3d}: '{guess}' (sim={similarity:.4f}){rank_info}")
             else:
                 print(f"Round {round_num:3d}: '{guess}' (sim={similarity:.4f})  "
                       f"(need 2 guesses for constraints)")
 
             if guess == self.semantle.word_of_the_day:
-                print(f"\nSolved! The word was '{guess}'")
+                print(f"\nSolved! The word was '{guess}' after {round_num} guesses")
                 return guess
 
-        if len(self.candidates) == 1:
-            answer = self.vocab[self.candidates[0]]
-            correct = self.semantle.check_guess(answer) == 1.0
-            result = "correct!" if correct else f"wrong (target was '{self.semantle.word_of_the_day}')"
-            print(f"\nBest guess: '{answer}' after {round_num} guesses — {result}")
-            return answer
-
-        raise ValueError("No candidates remaining — something went wrong")
+        # Hit max rounds — return the highest-probability word as best guess
+        best_idx = np.argmax(self.log_probs)
+        best_word = self.vocab[best_idx]
+        correct = best_word == self.semantle.word_of_the_day
+        result = "correct!" if correct else f"wrong (target was '{self.semantle.word_of_the_day}')"
+        print(f"\nHit {max_rounds} round limit. Best guess: '{best_word}' — {result}")
+        return best_word
 
 
 if __name__ == "__main__":
